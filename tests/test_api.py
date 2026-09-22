@@ -125,8 +125,10 @@ class CapabilityApiTests(unittest.TestCase):
     def test_06_wrong_signature_rejected(self):
         data = self.issue()
         payload, sig = data["token"].split(".")
-        # Flip the last character of the signature.
-        flipped = sig[:-1] + ("A" if sig[-1] != "A" else "B")
+        # Flip the FIRST character of the signature. (The last base64url char
+        # of a 32-byte value carries 2 ignored padding bits, so flipping it
+        # can decode back to the identical signature — always flip the first.)
+        flipped = ("A" if sig[0] != "A" else "B") + sig[1:]
         resp = self.verify(f"{payload}.{flipped}")
         self.assertEqual(resp.status_code, 401)
         self.assertEqual(resp.json()["error"], "bad_signature")
@@ -315,6 +317,221 @@ class CapabilityApiTests(unittest.TestCase):
         resp = self.client.get("/health")
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()["status"], "ok")
+
+    # -- subject revocation --------------------------------------------------
+
+    def revoke(self, subject, **overrides):
+        body = {"subject": subject}
+        body.update(overrides)
+        return self.client.post("/tokens/revoke-subject", json=body)
+
+    def revocation_subjects(self):
+        resp = self.client.get("/tokens/revocations")
+        self.assertEqual(resp.status_code, 200, resp.text)
+        return [r["subject"] for r in resp.json()["revocations"]]
+
+    def test_24_revoked_subject_rejected_and_nonce_preserved(self):
+        sub = "rev-alice"
+        data = self.issue(subject=sub, one_time=True)
+        self.assertEqual(self.verify(data["token"], consume=False).status_code, 200)
+
+        resp = self.revoke(sub)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        body = resp.json()
+        self.assertTrue(body["revoked"])
+        self.assertFalse(body["restored"])
+        self.assertGreaterEqual(body["cutoff"], data["issued_at"])
+        self.assertEqual(body["purge_after"], body["cutoff"] + 3600)
+
+        # Both a consuming verify and a dry run are rejected...
+        for consume in (True, False):
+            resp = self.verify(data["token"], consume=consume)
+            self.assertEqual(resp.status_code, 401)
+            self.assertEqual(resp.json()["error"], "subject_revoked")
+
+        # ...and the nonce was NOT burned: after restore the token verifies
+        # and consumes exactly once.
+        resp = self.revoke(sub, restore=True)
+        self.assertEqual(resp.status_code, 200)
+        self.assertFalse(resp.json()["revoked"])
+        self.assertTrue(resp.json()["restored"])
+
+        resp = self.verify(data["token"])
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertTrue(resp.json()["consumed"])
+        replay = self.verify(data["token"])
+        self.assertEqual(replay.status_code, 401)
+        self.assertEqual(replay.json()["error"], "nonce_replayed")
+
+    def test_25_only_tokens_at_or_before_cutoff_are_revoked(self):
+        sub = "rev-bob"
+        past = int(time.time()) - 60
+        resp = self.revoke(sub, cutoff=past)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(resp.json()["cutoff"], past)
+
+        # Tokens issued after the cutoff still verify.
+        data = self.issue(subject=sub)
+        self.assertEqual(self.verify(data["token"]).status_code, 200)
+
+        # A multi-use token backdated to the cutoff is rejected.
+        issued = tokenlib.issue_token(
+            app.state.settings.secret_key,
+            method="GET",
+            path="/files/hello.txt",
+            ttl_seconds=300,
+            subject=sub,
+            now=past - 5,
+        )
+        resp = self.verify(issued.token)
+        self.assertEqual(resp.status_code, 401)
+        self.assertEqual(resp.json()["error"], "subject_revoked")
+
+        # Subject-less tokens are unaffected by any revocation.
+        nosub = self.issue()
+        self.assertEqual(self.verify(nosub["token"]).status_code, 200)
+
+    def test_26_revocations_listing(self):
+        sub = "rev-carol"
+        resp = self.revoke(sub)
+        self.assertEqual(resp.status_code, 200)
+
+        resp = self.client.get("/tokens/revocations")
+        self.assertEqual(resp.status_code, 200, resp.text)
+        body = resp.json()
+        self.assertEqual(body["count"], len(body["revocations"]))
+        entry = next(r for r in body["revocations"] if r["subject"] == sub)
+        self.assertGreater(entry["cutoff"], 0)
+        self.assertGreater(entry["created_at"], 0)
+        self.assertEqual(entry["purge_after"], entry["cutoff"] + 3600)
+
+        # Re-revoking overwrites the cutoff instead of duplicating the row.
+        newer = int(time.time()) + 30
+        self.assertEqual(self.revoke(sub, cutoff=newer).status_code, 200)
+        entries = [
+            r for r in self.client.get("/tokens/revocations").json()["revocations"]
+            if r["subject"] == sub
+        ]
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["cutoff"], newer)
+
+    def test_27_admin_key_gate_when_configured(self):
+        from dataclasses import replace
+
+        settings = app.state.settings
+        app.state.settings = replace(settings, admin_key="adm1n")
+        try:
+            resp = self.revoke("rev-dave")
+            self.assertEqual(resp.status_code, 401)
+            self.assertEqual(resp.json()["error"], "unauthorized")
+            resp = self.client.get("/tokens/revocations")
+            self.assertEqual(resp.status_code, 401)
+            resp = self.client.post(
+                "/tokens/revoke-subject",
+                json={"subject": "rev-dave"},
+                headers={"X-Admin-Key": "wrong"},
+            )
+            self.assertEqual(resp.status_code, 401)
+            resp = self.client.post(
+                "/tokens/revoke-subject",
+                json={"subject": "rev-dave"},
+                headers={"X-Admin-Key": "adm1n"},
+            )
+            self.assertEqual(resp.status_code, 200)
+            resp = self.client.get("/tokens/revocations", headers={"X-Admin-Key": "adm1n"})
+            self.assertEqual(resp.status_code, 200)
+        finally:
+            app.state.settings = settings
+        self.revoke("rev-dave", restore=True)
+
+    def test_28_concurrent_verify_of_revoked_token_consumes_nothing(self):
+        # 12 racing verifications of a revoked one-time token must all fail
+        # with subject_revoked and none may burn the nonce; after a restore
+        # exactly one replay wins.
+        from app.db import Database
+
+        sub = "rev-erin"
+        data = self.issue(subject=sub, one_time=True)
+        self.assertEqual(self.revoke(sub).status_code, 200)
+
+        settings = app.state.settings
+        db: Database = app.state.db
+        outcomes: list[str] = []
+        lock = threading.Lock()
+
+        def attempt():
+            try:
+                tokenlib.verify_token(
+                    data["token"],
+                    secret_key=settings.secret_key,
+                    method="GET",
+                    path="/files/hello.txt",
+                    db=db,
+                    consume=True,
+                )
+                result = "ok"
+            except tokenlib.TokenError as exc:
+                result = exc.code
+            with lock:
+                outcomes.append(result)
+
+        def hammer():
+            barrier = threading.Barrier(12)
+
+            def gated():
+                barrier.wait()  # maximise the race window
+                attempt()
+
+            threads = [threading.Thread(target=gated) for _ in range(12)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+        hammer()
+        self.assertEqual(outcomes, ["subject_revoked"] * 12, outcomes)
+
+        self.assertTrue(self.revoke(sub, restore=True).json()["restored"])
+        outcomes.clear()
+        hammer()
+        self.assertEqual(outcomes.count("ok"), 1, outcomes)
+        self.assertEqual(outcomes.count("nonce_replayed"), 11, outcomes)
+
+    def test_29_revocation_rows_are_purged_after_max_ttl(self):
+        sub = "rev-frank"
+        # Cutoff far enough in the past that cutoff + max_ttl < now.
+        past = int(time.time()) - 3600 - 100
+        self.assertEqual(self.revoke(sub, cutoff=past).status_code, 200)
+        self.assertIn(sub, self.revocation_subjects())
+
+        removed_nonces, removed_revocations = app.state.db.purge_expired()
+        self.assertGreaterEqual(removed_revocations, 1)
+        self.assertNotIn(sub, self.revocation_subjects())
+
+    def test_30_revoke_request_validation(self):
+        # restore and cutoff are mutually exclusive.
+        resp = self.revoke("rev-x", restore=True, cutoff=1)
+        self.assertEqual(resp.status_code, 422)
+        # subject is required.
+        resp = self.client.post("/tokens/revoke-subject", json={})
+        self.assertEqual(resp.status_code, 422)
+        # restoring a never-revoked subject is a no-op.
+        resp = self.revoke("rev-never-seen", restore=True)
+        self.assertEqual(resp.status_code, 200)
+        self.assertFalse(resp.json()["restored"])
+
+    def test_31_download_with_revoked_subject(self):
+        sub = "rev-gina"
+        data = self.issue(subject=sub, one_time=True)
+        self.assertEqual(self.revoke(sub).status_code, 200)
+        resp = self.client.get(f"/files/hello.txt?token={data['token']}")
+        self.assertEqual(resp.status_code, 401)
+        self.assertEqual(resp.json()["error"], "subject_revoked")
+        # Restored again: the nonce survived, so the download succeeds.
+        self.assertTrue(self.revoke(sub, restore=True).json()["restored"])
+        resp = self.client.get(f"/files/hello.txt?token={data['token']}")
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertIn("hello capability world", resp.text)
 
 
 if __name__ == "__main__":

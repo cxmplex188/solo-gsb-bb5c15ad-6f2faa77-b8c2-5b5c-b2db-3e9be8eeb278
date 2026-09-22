@@ -25,6 +25,10 @@ from .db import Database
 from .schemas import (
     IssuedTokenResponse,
     IssueTokenRequest,
+    RevocationEntry,
+    RevocationListResponse,
+    RevokeSubjectRequest,
+    RevokeSubjectResponse,
     VerifyTokenRequest,
     VerifyTokenResponse,
 )
@@ -44,12 +48,13 @@ _ERROR_STATUS = {
     "bad_signature": status.HTTP_401_UNAUTHORIZED,
     "bad_payload": status.HTTP_401_UNAUTHORIZED,
     "expired": status.HTTP_401_UNAUTHORIZED,
+    "subject_revoked": status.HTTP_401_UNAUTHORIZED,
     "nonce_replayed": status.HTTP_401_UNAUTHORIZED,
     "method_mismatch": status.HTTP_403_FORBIDDEN,
     "path_mismatch": status.HTTP_403_FORBIDDEN,
 }
 
-#: Delete expired consumed nonces periodically.
+#: Delete expired consumed nonces and dead revocation rows periodically.
 _PURGE_INTERVAL_SECONDS = 10 * 60
 
 
@@ -91,14 +96,24 @@ async def lifespan(app: FastAPI) -> None:
     db = Database(settings.db_path)
     os.makedirs(settings.files_dir, exist_ok=True)
 
-    removed = db.purge_expired()
-    if removed:
-        logger.info("Purged %d expired nonce rows at startup", removed)
+    removed_nonces, removed_revocations = db.purge_expired()
+    if removed_nonces or removed_revocations:
+        logger.info(
+            "Purged %d expired nonce rows and %d dead revocation rows at startup",
+            removed_nonces,
+            removed_revocations,
+        )
 
     if settings.ephemeral:
         logger.warning(
             "CAPABILITY_SECRET is not set: generated an ephemeral key. "
             "Tokens will not survive a restart. Set CAPABILITY_SECRET in production."
+        )
+    if settings.admin_key is None:
+        logger.warning(
+            "CAPABILITY_ADMIN_KEY is not set: revocation admin endpoints are "
+            "unauthenticated. Set CAPABILITY_ADMIN_KEY (or CAPABILITY_ISSUER_KEY) "
+            "in production."
         )
 
     app.state.settings = settings
@@ -108,9 +123,9 @@ async def lifespan(app: FastAPI) -> None:
         while True:
             await asyncio.sleep(_PURGE_INTERVAL_SECONDS)
             try:
-                db.purge_expired()
+                db.purge_expired()  # purges both nonces and dead revocation rows
             except Exception:  # noqa: BLE001 - background housekeeping must never crash
-                logger.exception("Periodic nonce purge failed")
+                logger.exception("Periodic purge failed")
 
     purge_task = asyncio.create_task(purge_loop())
     try:
@@ -125,11 +140,11 @@ async def lifespan(app: FastAPI) -> None:
 
 app = FastAPI(
     title="Capability Token API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "Issue short-lived HMAC-signed capability tokens for HTTP operations "
         "(e.g. file downloads) and verify method/path binding, expiry, "
-        "signature and one-time nonces."
+        "signature, subject-level revocation and one-time nonces."
     ),
     lifespan=lifespan,
 )
@@ -163,6 +178,23 @@ def require_issuer_key(
 
 
 IssuerGuard = Depends(require_issuer_key)
+
+
+def require_admin_key(
+    settings: SettingsDep,
+    x_admin_key: Annotated[str | None, Header(alias="X-Admin-Key")] = None,
+) -> None:
+    """Gate the revocation admin endpoints behind an optional shared key."""
+    if settings.admin_key is not None:
+        provided = x_admin_key or ""
+        if not hmac.compare_digest(provided.encode("utf-8"), settings.admin_key.encode("utf-8")):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail={"error": "unauthorized", "detail": "invalid or missing X-Admin-Key"},
+            )
+
+
+AdminGuard = Depends(require_admin_key)
 
 
 @app.get("/health", tags=["meta"])
@@ -241,6 +273,56 @@ def verify(body: VerifyTokenRequest, settings: SettingsDep, db: DbDep) -> Verify
         subject=verified.subject,
         extra=verified.extra,
     )
+
+
+@app.post(
+    "/tokens/revoke-subject",
+    response_model=RevokeSubjectResponse,
+    tags=["tokens"],
+    dependencies=[AdminGuard],
+)
+def revoke_subject(
+    body: RevokeSubjectRequest, settings: SettingsDep, db: DbDep
+) -> RevokeSubjectResponse:
+    """Revoke all of a subject's tokens up to a cutoff, or restore them.
+
+    Revoking persists a ``cutoff`` row: verification then rejects any of the
+    subject's tokens with ``iat <= cutoff`` as ``401 subject_revoked`` without
+    consuming their one-time nonce. ``restore=true`` deletes the row, making
+    still-valid tokens usable again.
+    """
+    if body.restore:
+        removed = db.restore_subject(body.subject)
+        logger.info("Restored subject sub=%s (revocation existed=%s)", body.subject, removed)
+        return RevokeSubjectResponse(subject=body.subject, revoked=False, restored=removed)
+
+    cutoff = body.cutoff if body.cutoff is not None else int(time.time())
+    # Every token the cutoff can reject expires by cutoff + max_ttl, after
+    # which the row is dead weight and gets purged.
+    purge_after = cutoff + settings.max_ttl
+    db.revoke_subject(body.subject, cutoff=cutoff, purge_after=purge_after)
+    logger.info(
+        "Revoked subject sub=%s cutoff=%s purge_after=%s", body.subject, cutoff, purge_after
+    )
+    return RevokeSubjectResponse(
+        subject=body.subject,
+        revoked=True,
+        restored=False,
+        cutoff=cutoff,
+        purge_after=purge_after,
+    )
+
+
+@app.get(
+    "/tokens/revocations",
+    response_model=RevocationListResponse,
+    tags=["tokens"],
+    dependencies=[AdminGuard],
+)
+def list_revocations(db: DbDep) -> RevocationListResponse:
+    """List the currently persisted subject revocations."""
+    entries = [RevocationEntry(**row) for row in db.list_revocations()]
+    return RevocationListResponse(revocations=entries, count=len(entries))
 
 
 def _extract_token(

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class IssueTokenRequest(BaseModel):
@@ -84,6 +84,49 @@ class VerifyTokenResponse(BaseModel):
     token_id: str
     subject: str | None = None
     extra: dict[str, Any] = Field(default_factory=dict)
+
+
+class RevokeSubjectRequest(BaseModel):
+    subject: str = Field(
+        ..., min_length=1, max_length=256, description="Subject to revoke or restore"
+    )
+    cutoff: int | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Revoke this subject's tokens with iat <= cutoff (unix seconds). "
+            "Defaults to the current server time"
+        ),
+    )
+    restore: bool = Field(
+        default=False, description="Clear the subject's revocation instead of setting one"
+    )
+
+    @model_validator(mode="after")
+    def _restore_excludes_cutoff(self) -> "RevokeSubjectRequest":
+        if self.restore and self.cutoff is not None:
+            raise ValueError("cutoff must be omitted when restore is true")
+        return self
+
+
+class RevokeSubjectResponse(BaseModel):
+    subject: str
+    revoked: bool
+    restored: bool = False
+    cutoff: int | None = None
+    purge_after: int | None = None
+
+
+class RevocationEntry(BaseModel):
+    subject: str
+    cutoff: int
+    created_at: int
+    purge_after: int
+
+
+class RevocationListResponse(BaseModel):
+    revocations: list[RevocationEntry]
+    count: int
 
 
 class ErrorResponse(BaseModel):

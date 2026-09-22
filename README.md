@@ -9,6 +9,9 @@ HTTP 操作签发**短期 HMAC 签名令牌**，并在使用时进行严格验�
 - ⏱️ **短期有效**：签发时指定 TTL，服务端强制上限，过期即失效
 - 🔁 **可选一次性 nonce**：成功使用后原子写入 SQLite，重放请求被拒绝
   （`BEGIN IMMEDIATE` + 主键唯一约束，并发请求只有一个能成功）
+- 🚫 **主体级撤销**：管理员可按 `subject` 设置撤销截止时间，`iat ≤ 截止时间` 的令牌
+  一律返回 `401 subject_revoked`；撤销判断与 nonce 消费在**同一 SQLite 事务**中完成，
+  被撤销的令牌不会消耗 nonce，支持随时恢复
 - 🚀 启动时自动初始化数据库，监听 **8000** 端口
 - 🐳 提供 `Dockerfile` 与 `docker-compose.yml`，开箱即用
 
@@ -21,14 +24,14 @@ HTTP 操作签发**短期 HMAC 签名令牌**，并在使用时进行严格验�
 ├── app/
 │   ├── __init__.py
 │   ├── config.py        # 环境变量配置
-│   ├── db.py            # SQLite：一次性 nonce 的原子消费与过期清理
+│   ├── db.py            # SQLite：nonce 原子消费、主体撤销记录与过期清理
 │   ├── tokens.py        # 令牌签发 / 解析 / 验证（HMAC 核心）
 │   ├── schemas.py       # Pydantic 请求/响应模型
 │   └── main.py          # FastAPI 路由与启动生命周期
 ├── files/               # 受保护的示例下载目录（compose 只读挂载）
 │   └── hello.txt
 ├── tests/
-│   └── test_api.py      # 24 个端到端测试（无需网络/容器）
+│   └── test_api.py      # 32 个端到端测试（无需网络/容器）
 ├── requirements.txt
 ├── Dockerfile
 ├── docker-compose.yml
@@ -169,6 +172,61 @@ curl -X POST http://localhost:8000/tokens/verify \
 }
 ```
 
+### 4. 主体撤销与恢复（管理员接口）
+
+当某个主体（用户 / 客户端）的令牌泄露或需要整体下线时，可按 `subject` 撤销。
+两个接口均受管理员密钥保护：设置 `CAPABILITY_ADMIN_KEY` 后须携带
+`X-Admin-Key` 头；未设置时回退到 `CAPABILITY_ISSUER_KEY`。
+
+```bash
+# 撤销：alice 在「当前时间」及之前签发的所有令牌立即失效
+curl -X POST http://localhost:8000/tokens/revoke-subject \
+  -H "X-Admin-Key: $ADMIN_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"subject": "alice"}'
+# {"subject":"alice","revoked":true,"restored":false,"cutoff":1727000100,"purge_after":1727003700}
+
+# 也可以显式指定撤销截止时间：iat <= cutoff 的令牌被拒绝，之后的照常可用
+curl -X POST http://localhost:8000/tokens/revoke-subject \
+  -H "X-Admin-Key: $ADMIN_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"subject": "alice", "cutoff": 1727000000}'
+
+# 查看当前生效的撤销记录
+curl -H "X-Admin-Key: $ADMIN_KEY" http://localhost:8000/tokens/revocations
+# {"revocations":[{"subject":"alice","cutoff":1727000100,"created_at":1727000100,"purge_after":1727003700}],"count":1}
+
+# 恢复：删除撤销记录，未过期且 nonce 未被消耗的令牌重新可用
+curl -X POST http://localhost:8000/tokens/revoke-subject \
+  -H "X-Admin-Key: $ADMIN_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"subject": "alice", "restore": true}'
+# {"subject":"alice","revoked":false,"restored":true,"cutoff":null,"purge_after":null}
+```
+
+以上 curl 示例同样适用于 `docker compose up` 启动的部署（compose 把容器
+8000 端口映射到宿主机）；只需在 `.env` 中配置密钥：
+
+```bash
+# .env
+CAPABILITY_SECRET=<强随机密钥>
+CAPABILITY_ADMIN_KEY=<管理员密钥>     # 也可只设 CAPABILITY_ISSUER_KEY，管理接口会回退使用它
+
+docker compose up -d --build
+docker compose logs -f capability-api
+```
+
+行为要点：
+
+- 撤销记录**持久化**在 SQLite `subject_revocations` 表，服务重启后仍然生效；
+- 撤销判断与一次性 nonce 消费在**同一个 `BEGIN IMMEDIATE` 事务**中完成：被撤销的
+  令牌返回 `401 subject_revoked` 且 **nonce 不会被消耗**，恢复后令牌仍可正常使用；
+- 重复撤销同一 `subject` 会**覆盖**旧的截止时间（可用于扩大或缩小撤销范围）；
+- 每条记录带 `purge_after = cutoff + CAPABILITY_MAX_TTL`：超过该时刻后所有可能被
+  撤销命中的令牌必然已过期，后台清理任务（每 10 分钟，启动时也会执行一次）会删除
+  该记录，表不会无限增长；
+- 不带 `sub` 的令牌不参与撤销，验证仍然完全无状态。
+
 ## 验证规则（核心）
 
 `verify_token` 按以下顺序检查，任何一步失败立即返回稳定错误码：
@@ -180,8 +238,10 @@ curl -X POST http://localhost:8000/tokens/verify \
 4. **过期时间**：当前时间 `>= exp` 即拒绝（`expired`）；
 5. **方法绑定**：令牌方法 ≠ 请求方法返回 `403 method_mismatch`；
 6. **路径绑定**：令牌路径 ≠ 规范化后的请求路径返回 `403 path_mismatch`；
-7. **一次性 nonce**：仅在 `one_time=true` 且 `consume=true` 时，原子写入
-   `consumed_nonces`；已存在则返回 `nonce_replayed`。
+7. **主体撤销 + 一次性 nonce（同一事务）**：若令牌带 `sub` 且该主体存在撤销记录，
+   `iat <= cutoff` 返回 `401 subject_revoked`，**nonce 不被消耗**；否则当
+   `one_time=true` 且 `consume=true` 时原子写入 `consumed_nonces`，已存在则返回
+   `nonce_replayed`。两步在同一个 `BEGIN IMMEDIATE` 事务中完成，撤销与消费互不竞争。
 
 ### 路径规范化
 
@@ -202,6 +262,7 @@ curl -X POST http://localhost:8000/tokens/verify \
 | `bad_signature` | 401 | HMAC 签名不匹配（令牌被篡改或密钥不同） |
 | `bad_payload` | 401 | 负载声明类型/版本非法 |
 | `expired` | 401 | 令牌已过期 |
+| `subject_revoked` | 401 | 主体已被撤销（`iat` 不晚于撤销截止时间） |
 | `nonce_replayed` | 401 | 一次性令牌被重复使用 |
 | `method_mismatch` | 403 | HTTP 方法与绑定不一致 |
 | `path_mismatch` | 403 | 路径与绑定不一致 |
@@ -229,7 +290,8 @@ curl -X POST http://localhost:8000/tokens/verify \
 }
 ```
 
-- 多用途令牌（`one=false`）**完全无状态**：只靠签名和过期即可验证，数据库不记录任何东西；
+- 多用途令牌（`one=false`）且不带 `sub` 时**完全无状态**：只靠签名和过期即可验证，
+  数据库不记录任何东西；带 `sub` 的令牌验证时需查询撤销表；
 - 一次性令牌只在服务端记住一个不透明 nonce（`jti`），不存储令牌或负载内容。
 
 ## 一次性 nonce 的原子性（防重放）
@@ -250,19 +312,45 @@ CREATE TABLE consumed_nonces (
 
 `expires_at` 冗余入库，后台每 10 分钟（启动时也会执行一次）清除已过期行，保证表不无限增长。
 
+## 主体撤销的持久化与清理
+
+撤销记录与 nonce 存放在同一个 SQLite 数据库：
+
+```sql
+CREATE TABLE subject_revocations (
+    subject     TEXT PRIMARY KEY,
+    cutoff      INTEGER NOT NULL,   -- iat <= cutoff 的令牌被拒绝
+    created_at  INTEGER NOT NULL,
+    purge_after INTEGER NOT NULL    -- cutoff + CAPABILITY_MAX_TTL
+) WITHOUT ROWID;
+```
+
+验证时，撤销检查（`SELECT`）与 nonce 消费（`INSERT OR IGNORE`）在**同一个
+`BEGIN IMMEDIATE` 事务**中执行：要么发现撤销记录并整体回滚（nonce 原样保留），
+要么成功消费 nonce 并提交。因此"撤销"与"用掉一次性令牌"这两个并发事件绝不会
+互相穿插——被撤销主体的令牌不可能趁机烧掉 nonce，恢复后依然可用
+（测试 `test_28_concurrent_verify_of_revoked_token_consumes_nothing` 用 12 线程验证）。
+
+`purge_after = cutoff + CAPABILITY_MAX_TTL`：凡是 `iat <= cutoff` 的令牌，其
+`exp <= cutoff + max_ttl`，超过该时刻后撤销记录不可能再命中任何未过期令牌，
+后台清理任务会将其删除。
+
 ## 配置项（环境变量）
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `CAPABILITY_SECRET` | （启动时随机生成） | HMAC 签名密钥；生产必须固定并保密 |
 | `CAPABILITY_ISSUER_KEY` | 空（签发不鉴权） | 设置后，调用 `/tokens/issue` 须带匹配的 `X-Issuer-Key` 头 |
+| `CAPABILITY_ADMIN_KEY` | 空（回退到 `CAPABILITY_ISSUER_KEY`） | 设置后，调用 `/tokens/revoke-subject` 与 `/tokens/revocations` 须带匹配的 `X-Admin-Key` 头 |
 | `CAPABILITY_DB_PATH` | `./data/capabilities.db` | SQLite 文件路径，启动自动建库建表 |
 | `CAPABILITY_FILES_DIR` | `./files` | 受保护下载目录 |
 | `CAPABILITY_DEFAULT_TTL` | `300` | 默认有效期（秒） |
 | `CAPABILITY_MAX_TTL` | `3600` | 有效期硬上限（秒） |
 
 > 签发鉴权是可选项：能力令牌通常由内部可信服务签发，因此用环境变量配置一个共享密钥
-> 即可，无需用户体系或第三方账号。
+> 即可，无需用户体系或第三方账号。管理接口（撤销/恢复/列表）同理：未设置
+> `CAPABILITY_ADMIN_KEY` 时回退使用 `CAPABILITY_ISSUER_KEY`；两者都未设置时管理接口
+> 不鉴权（仅限本地实验，启动日志会给出 WARNING）。
 
 ## 运行测试
 
@@ -275,7 +363,9 @@ python tests/test_api.py
 
 覆盖：签发与 TTL 截断、路径规范化、签发密钥门禁、签名篡改、负载篡改、方法/路径绑定、
 过期、畸形令牌、一次性消费、dry-run、**12 线程并发重放只有 1 个成功**、无令牌下载、
-三种携带方式、HEAD/GET 绑定、缺失文件、目录穿越、健康检查等 24 个用例。
+三种携带方式、HEAD/GET 绑定、缺失文件、目录穿越、健康检查，以及主体撤销：撤销后
+`subject_revoked` 且 nonce 不消耗、恢复后可用、截止时间边界、撤销列表、管理员密钥
+门禁、**12 线程并发验证被撤销令牌无一消耗 nonce**、撤销记录过期清理等 32 个用例。
 
 ## 部署说明
 
@@ -289,5 +379,7 @@ python tests/test_api.py
 
 1. 生产环境始终设置强随机 `CAPABILITY_SECRET`，并通过密钥管理机制注入，不要提交到仓库；
 2. TTL 尽量短（分钟级），需要防重放的场景使用 `one_time=true`；
-3. 令牌应通过 HTTPS（TLS）传输，查询参数形式可能出现在访问日志中，敏感场景优先用请求头；
-4. 轮换密钥时可在负载中引入 `kid` 并支持多密钥验签（当前版本固定单密钥）。
+3. 签发时带上 `subject` 并配置 `CAPABILITY_ADMIN_KEY`：令牌泄露时可立即按主体撤销，
+   事后也可用 `restore` 恢复误伤；
+4. 令牌应通过 HTTPS（TLS）传输，查询参数形式可能出现在访问日志中，敏感场景优先用请求头；
+5. 轮换密钥时可在负载中引入 `kid` 并支持多密钥验签（当前版本固定单密钥）。
