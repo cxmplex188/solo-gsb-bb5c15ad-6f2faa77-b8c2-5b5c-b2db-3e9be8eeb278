@@ -37,6 +37,9 @@ class Settings:
     max_ttl: int
     #: Optional shared key guarding POST /tokens/issue (header X-Issuer-Key).
     issuer_key: str | None
+    #: Optional shared key guarding the revocation admin endpoints
+    #: (header X-Admin-Key). When unset those endpoints are disabled (503).
+    admin_key: str | None
     #: True when no CAPABILITY_SECRET was configured and a random key is used.
     ephemeral: bool
 
@@ -49,6 +52,7 @@ def load_settings() -> Settings:
         secret = secrets.token_urlsafe(32)
 
     issuer_key = os.environ.get("CAPABILITY_ISSUER_KEY", "").strip() or None
+    admin_key = os.environ.get("CAPABILITY_ADMIN_KEY", "").strip() or None
     files_dir = os.environ.get("CAPABILITY_FILES_DIR", os.path.join(os.getcwd(), "files"))
 
     default_ttl = _int_env("CAPABILITY_DEFAULT_TTL", 300)
@@ -68,5 +72,6 @@ def load_settings() -> Settings:
         default_ttl=default_ttl,
         max_ttl=max_ttl,
         issuer_key=issuer_key,
+        admin_key=admin_key,
         ephemeral=ephemeral,
     )

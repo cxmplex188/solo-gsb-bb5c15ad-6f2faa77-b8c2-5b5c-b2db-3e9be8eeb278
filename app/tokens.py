@@ -48,7 +48,7 @@ class TokenError(Exception):
     ``code`` is a stable machine-readable string returned by the HTTP API:
 
     malformed / bad_signature / bad_payload / expired / method_mismatch /
-    path_mismatch / nonce_replayed
+    path_mismatch / nonce_replayed / subject_revoked
     """
 
     def __init__(self, code: str, message: str) -> None:
@@ -258,10 +258,14 @@ def verify_token(
     4. expiry,
     5. method binding,
     6. path binding,
-    7. one-time nonce replay check / atomic consumption.
+    7. subject revocation + one-time nonce consumption, decided inside a
+       single SQLite transaction: a token whose ``iat`` is not after the
+       subject's revocation cutoff is rejected with ``subject_revoked``
+       and its nonce is *not* burned.
 
     ``consume=False`` performs a stateless dry run: a valid one-time token
-    is *not* burned, which is useful for HTTP ``HEAD`` preflights.
+    is *not* burned, which is useful for HTTP ``HEAD`` preflights. The
+    revocation check still applies — a revoked subject fails even a dry run.
     """
     now = int(time.time()) if now is None else now
     payload, payload_b, signature = parse_token(token)
@@ -305,9 +309,20 @@ def verify_token(
             f"token is bound to {token_path!r}, request path was {canonical_path(path)!r}",
         )
 
-    if one_time and consume:
-        if not db.consume_nonce(nonce, expires_at):
-            raise TokenError("nonce_replayed", "one-time token has already been used")
+    outcome = db.check_revocation_and_consume_nonce(
+        subject=subject,
+        issued_at=issued_at,
+        nonce=nonce,
+        expires_at=expires_at,
+        consume=one_time and consume,
+    )
+    if outcome == "subject_revoked":
+        raise TokenError(
+            "subject_revoked",
+            f"subject {subject!r} is revoked for tokens issued at or before the cutoff",
+        )
+    if outcome == "nonce_replayed":
+        raise TokenError("nonce_replayed", "one-time token has already been used")
 
     return VerifiedToken(
         payload=payload,

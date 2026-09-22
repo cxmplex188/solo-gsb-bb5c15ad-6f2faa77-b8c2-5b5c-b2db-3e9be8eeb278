@@ -24,6 +24,7 @@ os.environ["CAPABILITY_DB_PATH"] = os.path.join(_tmp, "test.db")
 os.environ["CAPABILITY_FILES_DIR"] = os.path.join(_tmp, "files")
 os.environ["CAPABILITY_DEFAULT_TTL"] = "300"
 os.environ["CAPABILITY_MAX_TTL"] = "3600"
+os.environ["CAPABILITY_ADMIN_KEY"] = "test-admin-key"
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -65,6 +66,25 @@ class CapabilityApiTests(unittest.TestCase):
         return self.client.post(
             "/tokens/verify",
             json={"token": token, "method": method, "path": path, "consume": consume},
+        )
+
+    def admin_headers(self):
+        return {"X-Admin-Key": "test-admin-key"}
+
+    def revoke(self, subject, cutoff=None, restore=False, headers=None):
+        body = {"subject": subject, "restore": restore}
+        if cutoff is not None:
+            body["cutoff"] = cutoff
+        return self.client.post(
+            "/tokens/revoke-subject",
+            json=body,
+            headers=headers if headers is not None else self.admin_headers(),
+        )
+
+    def list_revocations(self, headers=None):
+        return self.client.get(
+            "/tokens/revocations",
+            headers=headers if headers is not None else self.admin_headers(),
         )
 
     # -- issuing -----------------------------------------------------------
@@ -315,6 +335,275 @@ class CapabilityApiTests(unittest.TestCase):
         resp = self.client.get("/health")
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()["status"], "ok")
+
+    # -- subject revocation -------------------------------------------------
+
+    def test_24_admin_endpoints_require_key(self):
+        from dataclasses import replace
+
+        settings = app.state.settings
+
+        # Fail closed: without a configured admin key the endpoints are 503.
+        app.state.settings = replace(settings, admin_key=None)
+        try:
+            resp = self.revoke("revo-guard", headers={})
+            self.assertEqual(resp.status_code, 503)
+            self.assertEqual(resp.json()["error"], "admin_key_not_configured")
+            resp = self.list_revocations(headers={})
+            self.assertEqual(resp.status_code, 503)
+        finally:
+            app.state.settings = settings
+
+        # Configured: missing or wrong key -> 401, correct key -> 200.
+        self.assertEqual(self.revoke("revo-guard", headers={}).status_code, 401)
+        self.assertEqual(
+            self.revoke("revo-guard", headers={"X-Admin-Key": "wrong"}).status_code, 401
+        )
+        self.assertEqual(self.list_revocations(headers={}).status_code, 401)
+        resp = self.revoke("revo-guard")
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertTrue(resp.json()["revoked"])
+        self.revoke("revo-guard", restore=True)
+
+    def test_25_revoke_blocks_old_tokens_new_ones_still_work(self):
+        subject = "revo-basic"
+        secret = app.state.settings.secret_key
+        now = int(time.time())
+        old = tokenlib.issue_token(
+            secret,
+            method="GET",
+            path="/files/hello.txt",
+            ttl_seconds=300,
+            subject=subject,
+            now=now - 60,
+        )
+        # Not revoked yet -> valid.
+        self.assertEqual(self.verify(old.token).status_code, 200)
+
+        resp = self.revoke(subject, cutoff=now - 30)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        body = resp.json()
+        self.assertTrue(body["revoked"])
+        self.assertEqual(body["cutoff"], now - 30)
+
+        # iat (now-60) <= cutoff (now-30) -> revoked, even though unexpired.
+        resp = self.verify(old.token)
+        self.assertEqual(resp.status_code, 401)
+        self.assertEqual(resp.json()["error"], "subject_revoked")
+
+        # A token issued after the cutoff is unaffected.
+        fresh = tokenlib.issue_token(
+            secret,
+            method="GET",
+            path="/files/hello.txt",
+            ttl_seconds=300,
+            subject=subject,
+            now=now,
+        )
+        self.assertEqual(self.verify(fresh.token).status_code, 200, fresh.token)
+        self.revoke(subject, restore=True)
+
+    def test_26_cutoff_boundary_is_inclusive(self):
+        subject = "revo-boundary"
+        secret = app.state.settings.secret_key
+        now = int(time.time())
+        at_cutoff = tokenlib.issue_token(
+            secret, method="GET", path="/files/hello.txt",
+            ttl_seconds=300, subject=subject, now=now,
+        )
+        after_cutoff = tokenlib.issue_token(
+            secret, method="GET", path="/files/hello.txt",
+            ttl_seconds=300, subject=subject, now=now + 1,
+        )
+        self.revoke(subject, cutoff=now)
+        # "不晚于" — iat == cutoff is revoked; iat == cutoff + 1 is not.
+        resp = self.verify(at_cutoff.token)
+        self.assertEqual(resp.status_code, 401)
+        self.assertEqual(resp.json()["error"], "subject_revoked")
+        self.assertEqual(self.verify(after_cutoff.token).status_code, 200)
+        self.revoke(subject, restore=True)
+
+    def test_27_revoked_one_time_token_keeps_its_nonce(self):
+        subject = "revo-keep-nonce"
+        data = self.issue(one_time=True, subject=subject)
+        # Future cutoff deterministically covers the just-issued token.
+        self.revoke(subject, cutoff=int(time.time()) + 5)
+
+        resp = self.verify(data["token"])
+        self.assertEqual(resp.status_code, 401)
+        self.assertEqual(resp.json()["error"], "subject_revoked")
+
+        # Restore: the revoked attempt must NOT have consumed the nonce.
+        resp = self.revoke(subject, restore=True)
+        self.assertTrue(resp.json()["restored"])
+        resp = self.verify(data["token"])
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertTrue(resp.json()["consumed"])
+        # And now it is genuinely burned.
+        resp = self.verify(data["token"])
+        self.assertEqual(resp.status_code, 401)
+        self.assertEqual(resp.json()["error"], "nonce_replayed")
+
+    def test_28_restore_unknown_subject_is_a_noop(self):
+        resp = self.revoke("revo-never-existed", restore=True)
+        self.assertEqual(resp.status_code, 200, resp.text)
+        body = resp.json()
+        self.assertFalse(body["revoked"])
+        self.assertFalse(body["restored"])
+
+    def test_29_revocations_listing(self):
+        self.revoke("revo-list-a", cutoff=1000)
+        self.revoke("revo-list-b", cutoff=2000)
+        try:
+            resp = self.list_revocations()
+            self.assertEqual(resp.status_code, 200, resp.text)
+            entries = {e["subject"]: e for e in resp.json()["revocations"]}
+            self.assertEqual(resp.json()["count"], len(entries))
+            self.assertEqual(entries["revo-list-a"]["cutoff"], 1000)
+            self.assertEqual(entries["revo-list-b"]["cutoff"], 2000)
+            self.assertIn("created_at", entries["revo-list-a"])
+            self.assertIn("updated_at", entries["revo-list-a"])
+
+            # Re-revoking moves the cutoff and keeps a single row.
+            self.revoke("revo-list-a", cutoff=1500)
+            entries = {e["subject"]: e for e in self.list_revocations().json()["revocations"]}
+            self.assertEqual(entries["revo-list-a"]["cutoff"], 1500)
+        finally:
+            self.revoke("revo-list-a", restore=True)
+            self.revoke("revo-list-b", restore=True)
+        entries = {e["subject"]: e for e in self.list_revocations().json()["revocations"]}
+        self.assertNotIn("revo-list-a", entries)
+        self.assertNotIn("revo-list-b", entries)
+
+    def test_30_dry_run_still_enforces_revocation(self):
+        subject = "revo-dry-run"
+        data = self.issue(one_time=True, subject=subject)
+        self.revoke(subject, cutoff=int(time.time()) + 5)
+        # consume=false is a dry run, but revocation is not optional.
+        resp = self.verify(data["token"], consume=False)
+        self.assertEqual(resp.status_code, 401)
+        self.assertEqual(resp.json()["error"], "subject_revoked")
+        # The dry run did not burn the nonce either.
+        self.revoke(subject, restore=True)
+        self.assertEqual(self.verify(data["token"]).status_code, 200)
+
+    def test_31_concurrent_verifications_all_blocked_by_revocation(self):
+        # 12 racing verifications of a revoked one-time token: every one gets
+        # subject_revoked and the nonce survives to be used after a restore.
+        from app.db import Database
+
+        subject = "revo-race-blocked"
+        data = self.issue(one_time=True, subject=subject)
+        self.revoke(subject, cutoff=int(time.time()) + 30)
+        settings = app.state.settings
+        db: Database = app.state.db
+        outcomes: list[str] = []
+        lock = threading.Lock()
+
+        def attempt():
+            try:
+                tokenlib.verify_token(
+                    data["token"],
+                    secret_key=settings.secret_key,
+                    method="GET",
+                    path="/files/hello.txt",
+                    db=db,
+                    consume=True,
+                )
+                result = "ok"
+            except tokenlib.TokenError as exc:
+                result = exc.code
+            with lock:
+                outcomes.append(result)
+
+        barrier = threading.Barrier(12)
+
+        def gated():
+            barrier.wait()
+            attempt()
+
+        threads = [threading.Thread(target=gated) for _ in range(12)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(outcomes.count("subject_revoked"), 12, outcomes)
+
+        # None of the 12 attempts consumed the nonce.
+        self.revoke(subject, restore=True)
+        self.assertEqual(self.verify(data["token"]).status_code, 200)
+
+    def test_32_concurrent_verify_vs_revoke_is_atomic(self):
+        # Each verification and the revocation commit are single IMMEDIATE
+        # transactions, so every racing token ends up exactly one of:
+        # verified (nonce burned) or subject_revoked (nonce intact).
+        from app.db import Database
+
+        subject = "revo-race"
+        settings = app.state.settings
+        db: Database = app.state.db
+        tokens = [self.issue(one_time=True, subject=subject)["token"] for _ in range(8)]
+        outcomes: dict[str, str] = {}
+        lock = threading.Lock()
+        barrier = threading.Barrier(len(tokens) + 1)
+
+        def attempt(token):
+            barrier.wait()
+            try:
+                tokenlib.verify_token(
+                    token,
+                    secret_key=settings.secret_key,
+                    method="GET",
+                    path="/files/hello.txt",
+                    db=db,
+                    consume=True,
+                )
+                result = "ok"
+            except tokenlib.TokenError as exc:
+                result = exc.code
+            with lock:
+                outcomes[token] = result
+
+        threads = [threading.Thread(target=attempt, args=(t,)) for t in tokens]
+        for t in threads:
+            t.start()
+        barrier.wait()  # release the verifiers, then revoke mid-race
+        db.set_subject_revocation(subject, int(time.time()) + 30)
+        for t in threads:
+            t.join()
+
+        # No token may report a replay: each was presented exactly once.
+        self.assertEqual(set(outcomes.values()) - {"ok", "subject_revoked"}, set(), outcomes)
+
+        db.delete_subject_revocation(subject)
+        for token, outcome in outcomes.items():
+            resp = self.verify(token)
+            if outcome == "ok":
+                # Won the race -> nonce was consumed back then.
+                self.assertEqual(resp.status_code, 401, token)
+                self.assertEqual(resp.json()["error"], "nonce_replayed")
+            else:
+                # Lost to the revocation -> nonce was never consumed.
+                self.assertEqual(resp.status_code, 200, token)
+
+    def test_33_stale_revocations_are_purged(self):
+        from app.db import Database
+
+        db: Database = app.state.db
+        settings = app.state.settings
+        now = int(time.time())
+        # Cutoff so old that any token it could revoke has long expired.
+        db.set_subject_revocation("revo-purge-old", now - 2 * settings.max_ttl, now=now - 2 * settings.max_ttl)
+        db.set_subject_revocation("revo-purge-fresh", now, now=now)
+
+        nonces_removed, revocations_removed = db.purge_expired(
+            now=now, max_token_ttl=settings.max_ttl
+        )
+        self.assertGreaterEqual(revocations_removed, 1)
+        self.assertIsNone(db.get_subject_revocation("revo-purge-old"))
+        self.assertIsNotNone(db.get_subject_revocation("revo-purge-fresh"))
+        db.delete_subject_revocation("revo-purge-fresh")
 
 
 if __name__ == "__main__":

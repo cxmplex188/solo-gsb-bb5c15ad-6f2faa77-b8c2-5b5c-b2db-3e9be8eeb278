@@ -10,6 +10,7 @@ services:
       # in .env.example so the stack runs out of the box; change it for real use.
       CAPABILITY_SECRET: ${CAPABILITY_SECRET:-dev-insecure-secret-change-me-0123456789}
       CAPABILITY_ISSUER_KEY: ${CAPABILITY_ISSUER_KEY:-}
+      CAPABILITY_ADMIN_KEY: ${CAPABILITY_ADMIN_KEY:-}
       CAPABILITY_DB_PATH: /data/capabilities.db
       CAPABILITY_FILES_DIR: /app/files
       CAPABILITY_DEFAULT_TTL: ${CAPABILITY_DEFAULT_TTL:-300}

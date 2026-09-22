@@ -86,6 +86,46 @@ class VerifyTokenResponse(BaseModel):
     extra: dict[str, Any] = Field(default_factory=dict)
 
 
+class RevokeSubjectRequest(BaseModel):
+    subject: str = Field(
+        ..., min_length=1, max_length=256, description="Subject to revoke or restore"
+    )
+    cutoff: int | None = Field(
+        default=None,
+        ge=0,
+        description=(
+            "Revoke tokens with iat <= cutoff (unix seconds). Defaults to now. "
+            "Ignored when restore=true"
+        ),
+    )
+    restore: bool = Field(
+        default=False, description="If true, remove the subject's revocation instead"
+    )
+
+
+class RevokeSubjectResponse(BaseModel):
+    subject: str
+    revoked: bool = Field(description="Whether a revocation is in effect after this call")
+    restored: bool = Field(
+        default=False, description="True when this call removed an existing revocation"
+    )
+    cutoff: int | None = None
+    created_at: int | None = None
+    updated_at: int | None = None
+
+
+class RevocationEntry(BaseModel):
+    subject: str
+    cutoff: int
+    created_at: int
+    updated_at: int
+
+
+class RevocationListResponse(BaseModel):
+    revocations: list[RevocationEntry]
+    count: int
+
+
 class ErrorResponse(BaseModel):
     error: str
     detail: str
